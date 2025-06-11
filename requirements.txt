@@ -5,4 +5,5 @@ numpy
 joblib
 scikit-learn
 tensorflow
+requests
 kagglehub
