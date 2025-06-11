@@ -15,7 +15,7 @@ import requests
 import warnings
 import os
 import time
-import kagglehub # <-- Import the new library
+import kagglehub
 import shutil
 
 # Ignore common warnings for a cleaner output
@@ -70,7 +70,7 @@ class LogAndCapTransformer(BaseEstimator, TransformerMixin):
     def transform(self, X):
         X_log = np.log1p(pd.DataFrame(X))
         for i, col in enumerate(X_log.columns):
-            X_log[col] = X_log[col].clip(self.lower_bounds_[i], self.upper_bounds_[i])
+            X_log.iloc[:, i] = X_log.iloc[:, i].clip(self.lower_bounds_[i], self.upper_bounds_[i])
         return X_log.values
 
 class FrequencyEncoder(BaseEstimator, TransformerMixin):
@@ -85,23 +85,23 @@ class FrequencyEncoder(BaseEstimator, TransformerMixin):
         X_df = pd.DataFrame(X)
         X_copy = X_df.copy()
         for i, col in enumerate(X_df.columns):
-            X_copy[f'{col}_encoded'] = X_copy[col].map(self.freq_map_[i]).fillna(0)
-        return X_copy[[f'{col}_encoded' for col in X_df.columns]].values
+            X_copy[f'col_{i}_encoded'] = X_copy.iloc[:, i].map(self.freq_map_[i]).fillna(0)
+        return X_copy[[f'col_{i}_encoded' for i in range(X_df.shape[1])]].values
 
 # =============================================================================
 #  2. API SETUP AND GLOBAL ARTIFACTS
 # =============================================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, 'encoder_model_exp4.keras')
-RAW_DATA_FILENAME = 'realtor-data.csv' # The name of the file inside the Kaggle dataset
-LOCAL_RAW_DATA_PATH = os.path.join(BASE_DIR, RAW_DATA_FILENAME)
+# We define a consistent local name for the raw data file
+LOCAL_RAW_DATA_PATH = os.path.join(BASE_DIR, 'realtor-data.csv') 
 SIMILARITY_LOOKUP_PATH = os.path.join(BASE_DIR, 'similarity_lookup.pkl')
 ALL_PROPERTIES_PATH = os.path.join(BASE_DIR, 'all_properties.csv')
 
 PROPERTIES_API_URL = "http://wonederway.premiumasp.net/api/Recommendation/ListProperties"
 TOP_N_SIMILAR = 50
 
-app = FastAPI(title="Real Estate Recommender API", version="5.0.0")
+app = FastAPI(title="Real Estate Recommender API", version="5.1.0")
 artifacts = {}
 
 # =============================================================================
@@ -110,14 +110,11 @@ artifacts = {}
 
 def run_similarity_update():
     """
-    This function contains all the logic from batch_similarity.py.
-    It fetches all properties, processes them, and saves the similarity lookup.
+    Fetches all properties, processes them, and saves the similarity lookup.
     """
     global artifacts
     print("--- Starting background similarity update task... ---")
     
-    # Step 1: Fetch all properties
-    print("-> Fetching all properties...")
     try:
         response = requests.get(PROPERTIES_API_URL, timeout=60)
         response.raise_for_status()
@@ -125,42 +122,26 @@ def run_similarity_update():
         properties_df.to_csv(ALL_PROPERTIES_PATH, index=False)
         print(f"✅ Fetched and saved {len(properties_df)} properties.")
     except Exception as e:
-        print(f"❌ ERROR fetching properties: {e}")
-        return
+        print(f"❌ ERROR fetching properties: {e}"); return
 
-    # Step 2: Generate embeddings for all properties
-    print("-> Generating embeddings for all properties...")
     try:
         processed_data = artifacts['pipeline'].transform(properties_df)
         all_embeddings = artifacts['model'].predict(processed_data)
         property_ids = properties_df['propertyID'].tolist()
         print("✅ Embeddings generated.")
     except Exception as e:
-        print(f"❌ ERROR generating embeddings: {e}")
-        return
+        print(f"❌ ERROR generating embeddings: {e}"); return
 
-    # Step 3: Calculate cosine similarity
-    print("-> Calculating similarity matrix...")
     similarity_matrix = cosine_similarity(all_embeddings)
-    
-    # Step 4: Build and save the lookup dictionary
     similarity_lookup = {}
     for i, prop_id in enumerate(property_ids):
-        similar_indices = similarity_matrix[i].argsort()[::-1]
-        top_similar = []
-        for similar_idx in similar_indices:
-            if similar_idx != i:
-                similar_prop_id = property_ids[similar_idx]
-                score = similarity_matrix[i][similar_idx]
-                top_similar.append((similar_prop_id, score))
-            if len(top_similar) >= TOP_N_SIMILAR:
-                break
+        similar_indices = np.argsort(similarity_matrix[i])[::-1]
+        top_similar = [(property_ids[idx], similarity_matrix[i][idx]) for idx in similar_indices if property_ids[idx] != prop_id][:TOP_N_SIMILAR]
         similarity_lookup[prop_id] = top_similar
         
     joblib.dump(similarity_lookup, SIMILARITY_LOOKUP_PATH)
     print("✅ Similarity lookup file created.")
     
-    # Step 5: Update the live artifacts in the running API
     artifacts['similarity_lookup'] = similarity_lookup
     artifacts['all_properties'] = properties_df.set_index('propertyID')
     print("--- Background similarity update task complete. ---")
@@ -172,68 +153,68 @@ def run_similarity_update():
 @app.on_event("startup")
 def startup_event():
     """
-    Builds the pipeline, loads the model, and then either loads the 
-    pre-calculated similarities or runs the batch job to create them.
+    Builds pipeline, loads model, and creates/loads similarity data.
     """
     print("--- Server starting up... ---")
 
-    # Part 1: Download training data from Kaggle if it doesn't exist
     if not os.path.exists(LOCAL_RAW_DATA_PATH):
         print(f"⚠️ Raw data file not found at '{LOCAL_RAW_DATA_PATH}'.")
         print("-> Attempting to download from Kaggle...")
         try:
-            # This requires KAGGLE_USERNAME and KAGGLE_KEY environment variables to be set
-            path = kagglehub.dataset_download("ahmedshahriarsakib/usa-real-estate-dataset")
-            # The actual CSV file path after extraction
-            kaggle_csv_path = os.path.join(path, RAW_DATA_FILENAME)
-            # Copy the file to our local directory for consistent access
-            shutil.copy(kaggle_csv_path, LOCAL_RAW_DATA_PATH)
-            print("✅ Successfully downloaded and saved raw data from Kaggle.")
+            download_path = kagglehub.dataset_download("ahmedshahriarsakib/usa-real-estate-dataset")
+            # --- CORRECTED LOGIC ---
+            # Find the first .csv file in the downloaded directory
+            found_csv = None
+            for file in os.listdir(download_path):
+                if file.endswith(".csv"):
+                    found_csv = os.path.join(download_path, file)
+                    break
+            
+            if found_csv:
+                shutil.copy(found_csv, LOCAL_RAW_DATA_PATH)
+                print(f"✅ Successfully copied '{os.path.basename(found_csv)}' to '{LOCAL_RAW_DATA_PATH}'.")
+            else:
+                raise RuntimeError("Could not find a CSV file in the Kaggle download.")
         except Exception as e:
-            raise RuntimeError(f"❌ Failed to download data from Kaggle. Please check Kaggle credentials. Error: {e}")
+            raise RuntimeError(f"❌ Failed to get data from Kaggle. Error: {e}")
     
-    # Part 2: Build and fit the preprocessing pipeline
     print("-> Building preprocessing pipeline...")
     df_raw = pd.read_csv(LOCAL_RAW_DATA_PATH, low_memory=False)
     
+    # Define pipeline components...
     cols_log_cap = ['price', 'bed', 'bath', 'house_size']
     cols_boxcox = ['acre_lot']
     cols_freq = ['brokered_by', 'city', 'zip_code']
     cols_onehot = ['status', 'price_range']
     cols_label = ['state']
     
-    numeric_pipe = Pipeline(steps=[('imputer', SimpleImputer(strategy='median')), ('log_and_cap', LogAndCapTransformer()), ('scaler', StandardScaler())])
-    acre_pipe = Pipeline(steps=[('imputer', SimpleImputer(strategy='median')), ('boxcox', PowerTransformer(method='box-cox')), ('scaler', StandardScaler())])
-    freq_pipe = Pipeline(steps=[('imputer', SimpleImputer(strategy='constant', fill_value='Unknown')), ('frequency_encoder', FrequencyEncoder()), ('scaler', StandardScaler())])
-    label_pipe = Pipeline(steps=[('imputer', SimpleImputer(strategy='most_frequent')), ('encoder', OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)), ('scaler', StandardScaler())])
-    onehot_pipe = Pipeline(steps=[('imputer', SimpleImputer(strategy='most_frequent')), ('encoder', OneHotEncoder(handle_unknown='ignore', sparse_output=False, drop=None))])
+    numeric_pipe = Pipeline([('imputer', SimpleImputer(strategy='median')), ('log_cap', LogAndCapTransformer()), ('scaler', StandardScaler())])
+    acre_pipe = Pipeline([('imputer', SimpleImputer(strategy='median')), ('boxcox', PowerTransformer(method='box-cox')), ('scaler', StandardScaler())])
+    freq_pipe = Pipeline([('imputer', SimpleImputer(strategy='constant', fill_value='Unknown')), ('encoder', FrequencyEncoder()), ('scaler', StandardScaler())])
+    label_pipe = Pipeline([('imputer', SimpleImputer(strategy='most_frequent')), ('encoder', OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)), ('scaler', StandardScaler())])
+    onehot_pipe = Pipeline([('imputer', SimpleImputer(strategy='most_frequent')), ('encoder', OneHotEncoder(handle_unknown='ignore', sparse_output=False, drop=None))])
     
-    preprocessor = ColumnTransformer(transformers=[
-        ('numeric', numeric_pipe, cols_log_cap), ('acre_lot', acre_pipe, cols_boxcox),
-        ('frequency', freq_pipe, cols_freq), ('label', label_pipe, cols_label),
-        ('onehot', onehot_pipe, cols_onehot)], remainder='passthrough')
+    preprocessor = ColumnTransformer([('numeric', numeric_pipe, cols_log_cap), ('acre', acre_pipe, cols_boxcox),
+                                      ('freq', freq_pipe, cols_freq), ('label', label_pipe, cols_label),
+                                      ('onehot', onehot_pipe, cols_onehot)], remainder='passthrough')
 
-    master_pipeline = Pipeline(steps=[('cleaner', InitialCleaner()), ('engineer', FeatureEngineer()), ('preprocessor', preprocessor)])
+    master_pipeline = Pipeline([('cleaner', InitialCleaner()), ('engineer', FeatureEngineer()), ('preprocessor', preprocessor)])
     
     X_train = df_raw.copy().dropna(subset=['price', 'state', 'zip_code'])
     master_pipeline.fit(X_train)
     artifacts['pipeline'] = master_pipeline
     print("✅ Pipeline built and fitted.")
 
-    # Part 3: Load the ML model
-    if not os.path.exists(MODEL_PATH):
-        raise RuntimeError(f"Could not find Keras model at '{MODEL_PATH}'.")
     artifacts['model'] = tf.keras.models.load_model(MODEL_PATH)
     print("✅ Keras model loaded.")
 
-    # Part 4: Load or create the similarity data
     if os.path.exists(SIMILARITY_LOOKUP_PATH) and os.path.exists(ALL_PROPERTIES_PATH):
-        print("-> Found existing similarity data. Loading into memory...")
+        print("-> Found existing similarity data. Loading...")
         artifacts['similarity_lookup'] = joblib.load(SIMILARITY_LOOKUP_PATH)
         artifacts['all_properties'] = pd.read_csv(ALL_PROPERTIES_PATH).set_index('propertyID')
         print("✅ Recommendation artifacts loaded.")
     else:
-        print("⚠️ Similarity data not found. Running initial batch job to create it...")
+        print("⚠️ Similarity data not found. Running initial batch job...")
         run_similarity_update()
     
     print("--- Server startup complete. ---")
@@ -242,53 +223,35 @@ def startup_event():
 # =============================================================================
 #  5. PYDANTIC MODELS & API ENDPOINTS
 # =============================================================================
-
 class PropertyFeatures(BaseModel):
-    brokered_by: Optional[float]=None; status: Optional[str]=None; price: Optional[float]=None
-    bed: Optional[float]=None; bath: Optional[float]=None; acre_lot: Optional[float]=None
-    street: Optional[str]=None; city: Optional[str]=None; state: Optional[str]=None
-    zip_code: Optional[str]=None; house_size: Optional[float]=None; prev_sold_date: Optional[str]=None
-
-class EmbeddingResponse(BaseModel):
-    message: str; embedding: List[float]
-
-class SimilarProperty(BaseModel):
-    details: Any; similarity_score: float
-
-class SimilarityResponse(BaseModel):
-    source_property: Any; similar_properties: List[SimilarProperty]
+    brokered_by: Optional[float]=None; status: Optional[str]=None; price: Optional[float]=None; bed: Optional[float]=None; bath: Optional[float]=None; acre_lot: Optional[float]=None; street: Optional[str]=None; city: Optional[str]=None; state: Optional[str]=None; zip_code: Optional[str]=None; house_size: Optional[float]=None; prev_sold_date: Optional[str]=None
+class EmbeddingResponse(BaseModel): message: str; embedding: List[float]
+class SimilarProperty(BaseModel): details: Any; similarity_score: float
+class SimilarityResponse(BaseModel): source_property: Any; similar_properties: List[SimilarProperty]
 
 @app.post("/generate-embedding", response_model=EmbeddingResponse, tags=["On-Demand Embedding"])
 def generate_embedding(property_features: PropertyFeatures):
-    if 'pipeline' not in artifacts or 'model' not in artifacts:
-        raise HTTPException(status_code=503, detail="Core artifacts not loaded.")
+    if 'pipeline' not in artifacts or 'model' not in artifacts: raise HTTPException(status_code=503, detail="Core artifacts not loaded.")
     try:
         input_df = pd.DataFrame([property_features.dict()])
         processed_features = artifacts['pipeline'].transform(input_df)
         embedding = artifacts['model'].predict(processed_features)[0]
         return {"message": "Embedding generated successfully.", "embedding": embedding.tolist()}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/get-similar-properties/{property_id}", response_model=SimilarityResponse, tags=["Recommendation"])
 def get_similar_properties(property_id: int):
-    if 'similarity_lookup' not in artifacts or 'all_properties' not in artifacts:
-        raise HTTPException(status_code=503, detail="Recommendation data not ready.")
+    if 'similarity_lookup' not in artifacts: raise HTTPException(status_code=503, detail="Recommendation data not ready.")
     try:
-        if property_id not in artifacts['similarity_lookup']:
-            raise HTTPException(status_code=404, detail=f"Property ID {property_id} not found.")
+        if property_id not in artifacts['similarity_lookup']: raise HTTPException(status_code=404, detail=f"Property ID {property_id} not found.")
         source_details = artifacts['all_properties'].loc[property_id].to_dict()
         similar_items = artifacts['similarity_lookup'][property_id]
         similar_list = [{"details": artifacts['all_properties'].loc[sim_id].to_dict(), "similarity_score": score} for sim_id, score in similar_items if sim_id in artifacts['all_properties'].index]
         return {"source_property": source_details, "similar_properties": similar_list}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/update-similarity-matrix", status_code=202, tags=["Admin"])
 def update_similarity_matrix(background_tasks: BackgroundTasks):
-    """
-    Triggers a background task to refresh the property data and recalculate similarities.
-    """
     print("Received request to update similarity matrix.")
     background_tasks.add_task(run_similarity_update)
     return {"message": "Similarity update task has been started in the background."}
