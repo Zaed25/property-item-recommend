@@ -40,7 +40,7 @@ REQUIRED_COLUMNS = [
 app = FastAPI(
     title="Real Estate Recommender API",
     description="An API to generate property embeddings and find similar properties.",
-    version="3.0.0"
+    version="3.2.0" # Version updated for memory optimization
 )
 
 # A dictionary to hold our loaded artifacts
@@ -64,13 +64,11 @@ async def get_api_key(api_key_header: str = Security(api_key_header)):
     if API_KEY and api_key_header == API_KEY:
         return api_key_header
     else:
-        # If the server has an API_KEY set, but the client is wrong, raise 401
         if API_KEY:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or missing API Key"
             )
-        # If the server does not have an API_KEY, allow the request
         else:
             return None
 
@@ -82,7 +80,6 @@ async def get_api_key(api_key_header: str = Security(api_key_header)):
 def ensure_schema(df: pd.DataFrame) -> pd.DataFrame:
     """
     Ensures the incoming DataFrame has all the columns required by the pipeline.
-    If a column is missing, it's added with None (NaN) values.
     """
     for col in REQUIRED_COLUMNS:
         if col not in df.columns:
@@ -90,26 +87,22 @@ def ensure_schema(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # =============================================================================
-#  4. BATCH SIMILARITY PROCESSING LOGIC
+#  4. BATCH SIMILARITY PROCESSING LOGIC (MEMORY OPTIMIZED)
 # =============================================================================
 
 def run_similarity_update_task():
     """
-    The complete batch processing logic. Fetches latest properties, generates
-    new embeddings, calculates similarities, and saves the new artifact files.
+    The complete batch processing logic, now optimized for low memory usage.
     """
     print("--- Starting background similarity update task... ---")
 
     try:
-        # Step 1: Fetch latest property data from the external API
+        # Step 1: Fetch latest property data
         print(f"-> Fetching property data from {PROPERTIES_API_URL}...")
         response = requests.get(PROPERTIES_API_URL, timeout=60)
         response.raise_for_status()
         properties_df = pd.DataFrame(response.json()['data'])
-
-        # Ensure the fetched data has the required columns before saving and processing
         properties_df = ensure_schema(properties_df)
-
         properties_df.to_csv(ALL_PROPERTIES_PATH, index=False)
         print(f"✅ Fetched and saved {len(properties_df)} new properties.")
 
@@ -120,27 +113,55 @@ def run_similarity_update_task():
         property_ids = properties_df['propertyID'].tolist()
         print("✅ Embeddings generated.")
 
-        # Step 3: Calculate the new similarity matrix
-        print("-> Calculating new similarity matrix...")
-        similarity_matrix = cosine_similarity(all_embeddings)
-
-        # Step 4: Create the new lookup dictionary
+        # ================================================================= #
+        #  START: MEMORY OPTIMIZATION - AVOID FULL SIMILARITY MATRIX        #
+        # ================================================================= #
+        
+        # Steps 3 & 4: Calculate similarities and build the lookup iteratively
+        print("-> Calculating similarities iteratively to save memory...")
         new_similarity_lookup = {}
         for i, prop_id in enumerate(property_ids):
-            similar_indices = np.argsort(similarity_matrix[i])[::-1]
-            top_similar = [(property_ids[idx], similarity_matrix[i][idx]) for idx in similar_indices if property_ids[idx] != prop_id][:TOP_N_SIMILAR]
+            # Reshape the current embedding to a 2D array for cosine_similarity
+            current_embedding = all_embeddings[i].reshape(1, -1)
+            
+            # Calculate similarity of the current property against all others
+            # This creates a small (1, N) array instead of a large (N, N) matrix
+            similarity_scores = cosine_similarity(current_embedding, all_embeddings)[0]
+            
+            # Get indices of top similar items, sorted descending
+            similar_indices = np.argsort(similarity_scores)[::-1]
+            
+            # Build the list of top N similar properties, excluding the property itself
+            top_similar = []
+            for idx in similar_indices:
+                if property_ids[idx] == prop_id:
+                    continue
+                if len(top_similar) >= TOP_N_SIMILAR:
+                    break
+                # Convert numpy float32 to native Python float for JSON serialization
+                score = float(similarity_scores[idx])
+                top_similar.append((property_ids[idx], score))
+            
             new_similarity_lookup[prop_id] = top_similar
+
+            # Optional: Add a progress indicator for long tasks
+            if (i + 1) % 100 == 0:
+                print(f"   ... processed {i + 1}/{len(property_ids)} properties for similarity.")
+
+        # ================================================================= #
+        #  END: MEMORY OPTIMIZATION                                         #
+        # ================================================================= #
 
         # Step 5: Overwrite the old artifact files with the new data
         joblib.dump(new_similarity_lookup, SIMILARITY_LOOKUP_PATH)
         print("✅ New similarity lookup file saved.")
-
+        
         # Step 6. IMPORTANT: Update the artifacts loaded in memory for immediate use
         artifacts['similarity_lookup'] = new_similarity_lookup
         artifacts['all_properties'] = properties_df.set_index('propertyID')
         artifacts['all_embeddings'] = all_embeddings
         artifacts['property_ids'] = property_ids
-
+        
         print("--- ✅ Background similarity update complete. ---")
 
     except Exception as e:
@@ -152,27 +173,17 @@ def run_similarity_update_task():
 
 @app.on_event("startup")
 def load_artifacts():
-    """
-    Loads all pre-built artifacts into memory when the server starts.
-    """
     print("--- Loading pre-built artifacts... ---")
     artifacts['pipeline'] = joblib.load(PIPELINE_PATH)
     artifacts['model'] = tf.keras.models.load_model(MODEL_PATH)
     artifacts['similarity_lookup'] = joblib.load(SIMILARITY_LOOKUP_PATH)
     all_props_df = pd.read_csv(ALL_PROPERTIES_PATH)
-
-    # Ensure the loaded data has the required columns before processing
     all_props_df = ensure_schema(all_props_df)
-
     artifacts['all_properties'] = all_props_df.set_index('propertyID')
-
-    # Pre-calculate embeddings for all existing properties for dynamic comparison
     print("-> Pre-calculating all property embeddings...")
     artifacts['all_embeddings'] = artifacts['model'].predict(artifacts['pipeline'].transform(all_props_df))
     artifacts['property_ids'] = all_props_df['propertyID'].tolist()
-
     print("--- All artifacts loaded. Ready to serve. ---")
-
 
 # =============================================================================
 #  6. PYDANTIC MODELS FOR DATA VALIDATION
@@ -188,25 +199,19 @@ class EmbeddingResponse(BaseModel): message: str; embedding: List[float]
 class SimilarProperty(BaseModel): details: Any; similarity_score: float
 class SimilarityResponse(BaseModel): source_property: Any; similar_properties: List[SimilarProperty]
 
-
 # =============================================================================
 #  7. API ENDPOINTS
 # =============================================================================
 
-# This endpoint remains public for status checks
 @app.get("/", tags=["Status"])
 def read_root():
     return {"status": "ok", "message": "Welcome to the Real Estate Recommender API."}
 
-# The following endpoints are now protected by the API key
 @app.post("/generate-embedding", response_model=EmbeddingResponse, tags=["Utilities"], dependencies=[Depends(get_api_key)])
 def generate_embedding(features: PropertyFeatures):
-    """Generates an embedding for a single property without finding similarities."""
     try:
         input_df = pd.DataFrame([features.dict()])
-        # Ensure schema before transforming
         input_df = ensure_schema(input_df)
-
         processed_features = artifacts['pipeline'].transform(input_df)
         embedding = artifacts['model'].predict(processed_features)[0]
         return {"message": "Embedding generated successfully.", "embedding": embedding.tolist()}
@@ -215,11 +220,16 @@ def generate_embedding(features: PropertyFeatures):
 
 @app.get("/get-similar-properties/{property_id}", response_model=SimilarityResponse, tags=["Recommendation"], dependencies=[Depends(get_api_key)])
 def get_similar_properties(property_id: int):
-    """Finds similar properties for an item already in the database."""
     try:
         source_details = artifacts['all_properties'].loc[property_id].to_dict()
+        source_details['propertyID'] = property_id
         similar_items = artifacts['similarity_lookup'][property_id]
-        similar_list = [{"details": artifacts['all_properties'].loc[sim_id].to_dict(), "similarity_score": score} for sim_id, score in similar_items if sim_id in artifacts['all_properties'].index]
+        similar_list = []
+        for sim_id, score in similar_items:
+            if sim_id in artifacts['all_properties'].index:
+                details = artifacts['all_properties'].loc[sim_id].to_dict()
+                details['propertyID'] = int(sim_id)
+                similar_list.append({"details": details, "similarity_score": score})
         return {"source_property": source_details, "similar_properties": similar_list}
     except KeyError:
         raise HTTPException(status_code=404, detail=f"Property with ID {property_id} not found.")
@@ -228,35 +238,26 @@ def get_similar_properties(property_id: int):
 
 @app.post("/find-similar-to-new-property", response_model=SimilarityResponse, tags=["Recommendation"], dependencies=[Depends(get_api_key)])
 def find_similar_to_new_property(features: PropertyFeatures):
-    """Finds similar properties for a new, unseen property."""
     try:
         input_df = pd.DataFrame([features.dict()])
-        # Ensure schema before transforming
         input_df = ensure_schema(input_df)
-
         processed_features = artifacts['pipeline'].transform(input_df)
         new_embedding = artifacts['model'].predict(processed_features)
-
         similarity_scores = cosine_similarity(new_embedding, artifacts['all_embeddings'])[0]
-
         similar_indices = np.argsort(similarity_scores)[::-1]
-
         top_similar = []
         for idx in similar_indices[:TOP_N_SIMILAR]:
             prop_id = artifacts['property_ids'][idx]
             score = similarity_scores[idx]
             details = artifacts['all_properties'].loc[prop_id].to_dict()
+            details['propertyID'] = int(prop_id)
             top_similar.append({"details": details, "similarity_score": float(score)})
-
         return {"source_property": features.dict(), "similar_properties": top_similar}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/update-similarities", status_code=202, tags=["Admin"], dependencies=[Depends(get_api_key)])
 def trigger_similarity_update(background_tasks: BackgroundTasks):
-    """
-    Triggers a background task to refresh all recommendation data.
-    """
     print("Received request to update similarity matrix.")
     background_tasks.add_task(run_similarity_update_task)
     return {"message": "Similarity update task has been started in the background. It may take several minutes to complete."}
